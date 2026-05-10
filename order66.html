@@ -174,7 +174,8 @@ const G = {
   time:{last:0,dt:0},
   cam:{shake:0,shakeT:0},
   player:null,
-  enemies:[], bolts:[], particles:[], bodies:[], platforms:[], obstacles:[],
+  enemies:[], bolts:[], particles:[], bodies:[], platforms:[], obstacles:[], explosions:[],
+  saberTrail:[],
   level:null,
   distance:0, kills:0,
   stars:[], embers:[], rain:[],
@@ -928,7 +929,8 @@ function startGame(){
   G.distance=0; G.kills=0;
   G.scrollX=0; G.worldGenX=0;
   G.cam={shake:0,shakeT:0};
-  G.enemies=[]; G.bolts=[]; G.particles=[]; G.bodies=[]; G.platforms=[]; G.obstacles=[];
+  G.enemies=[]; G.bolts=[]; G.particles=[]; G.bodies=[]; G.platforms=[]; G.obstacles=[]; G.explosions=[];
+  G.saberTrail=[];
   G.saberThrow=null; G.forceWave=null; G.lightning=[];
   G.spawnTimer=2;
   G.embers=[]; G.rain=[];
@@ -1070,22 +1072,34 @@ function spawnEnemy(){
   const p = findPlatformAt(x);
   if(!p) return;
   const heroH = G.H*0.16;
+  const diff = Math.min(G.distance / 1500, 1);
+  // Mix droids in - more frequent at higher difficulty
+  const droidChance = 0.20 + diff*0.15;
+  let etype;
+  const r = Math.random();
+  if(r < droidChance) etype = 'droid';
+  else if(r < droidChance + 0.13) etype = 'commander';
+  else etype = 'trooper';
+
+  const isDroid = etype === 'droid';
   G.enemies.push({
     x:x, y:p.y, vx:0, vy:0,
-    w: heroH*0.42, h: heroH*0.92,
+    w: heroH * (isDroid ? 0.50 : 0.42),
+    h: heroH * (isDroid ? 1.05 : 0.92),
     onGround:true,
     facing: fromRight?-1:1,
-    hp:1,
+    hp: isDroid ? 3 : 1,
     aimT: 0,
     raiseT: 0,
     burstCount:0, burstDelay:0,
     state:'wait',
     waitT: 0,
-    type: Math.random()<0.15?'commander':'trooper',
+    type: etype,
     walkT:Math.random()*Math.PI*2,
-    crouching: Math.random()<0.3,
+    crouching: !isDroid && Math.random()<0.3,
     dead:false,
-    sinceFire: 1.5 + Math.random()*1.5
+    sinceFire: 1.5 + Math.random()*1.5,
+    armRecoil: 0
   });
 }
 
@@ -1243,41 +1257,54 @@ function update(dt){
   if(p.whirl>0){
     p.saberAngle += dt*30;
   } else if(p.attacking){
-    // 3 different swing animations
+    // 3 visually distinct swing animations
     const t = p.attackT / 0.32;
+    const e = easeInOut(t);
     let startAng, endAng;
     if(p.attackCombo === 0){
-      // Downward slash: from up to down
-      startAng = -Math.PI*0.7;
-      endAng = Math.PI*0.3;
+      // Big OVERHEAD slash: from above-back to forward-down
+      // Starts: saber raised over head pointing back
+      // Ends: saber pointing down-forward after slash
+      startAng = -Math.PI*0.85;
+      endAng = Math.PI*0.45;
     } else if(p.attackCombo === 1){
-      // Upward slash: from down to up
-      startAng = Math.PI*0.3;
-      endAng = -Math.PI*0.7;
+      // RISING UPPERCUT slash: from below-forward to above-forward
+      startAng = Math.PI*0.45;
+      endAng = -Math.PI*0.85;
     } else {
-      // Thrust forward
-      startAng = -Math.PI*0.1;
-      endAng = 0;
+      // STAB / THRUST forward: small recoil then thrust
+      // Quick forward jab, with slight pull-back at start
+      const stab = t < 0.3 ? -0.25*(1-t/0.3) : (t-0.3)/0.7 * 0.15;
+      startAng = -Math.PI*0.05;
+      endAng = startAng;
+      p.saberAngle = startAng + stab;
+      // Translate "thrust" effect handled by drawing — nothing more here
+      if(p.facing === -1) p.saberAngle = Math.PI - p.saberAngle;
+      // Skip rest of saber computation
+      p._stabT = t;
     }
-    p.saberAngle = startAng + (endAng - startAng) * easeInOut(t);
-    if(p.facing === -1) p.saberAngle = Math.PI - p.saberAngle;
+    if(p.attackCombo !== 2){
+      p.saberAngle = startAng + (endAng - startAng) * e;
+      if(p.facing === -1) p.saberAngle = Math.PI - p.saberAngle;
+      p._stabT = 0;
+    }
   } else if(p.blocking){
     // Block stance: saber held vertically in front
-    p.saberTargetAngle = p.facing===1 ? -Math.PI/2 : -Math.PI/2;
+    p.saberTargetAngle = -Math.PI/2;
     p.saberAngle += (p.saberTargetAngle - p.saberAngle) * Math.min(1, dt*15);
+    p._stabT = 0;
   } else {
     // Default: saber held forward, slight drag when running
     let target = p.facing===1 ? 0 : Math.PI;
     if(Math.abs(p.vx) > G.W*0.1){
-      // Drag effect: saber tilts back
       const drag = -p.facing * Math.min(0.5, Math.abs(p.vx)/(G.W*0.4)) * 0.6;
       target += drag;
     }
-    // Normalize angle for shortest path
     let diff = target - p.saberAngle;
     while(diff > Math.PI) diff -= Math.PI*2;
     while(diff < -Math.PI) diff += Math.PI*2;
     p.saberAngle += diff * Math.min(1, dt*10);
+    p._stabT = 0;
   }
 
   if(specialPress && p.sp >= p.maxSp){
@@ -1301,7 +1328,17 @@ function update(dt){
 
   if(p.invuln>0) p.invuln-=dt;
 
-  if(Math.abs(mx)>0.1 && p.onGround) p.runT += dt*14;
+  if(Math.abs(mx)>0.1 && p.onGround){
+    p.runT += dt*10;
+  } else if(!p.onGround){
+    // In air - hold mid-jump pose
+    p.runT = Math.PI/2;
+  } else {
+    // Idle - slowly return to neutral (runT = 0 or PI)
+    const target = 0;
+    const diff = target - (p.runT % (Math.PI*2));
+    p.runT += diff * Math.min(1, dt*5);
+  }
 
   // Save prev position for obstacle collision
   const prevY = p.y;
@@ -1361,14 +1398,19 @@ function update(dt){
   updateEnemies(dt, diff);
   updateBolts(dt);
   updateParticles(dt);
+  updateExplosions(dt);
   updateBodies(dt);
   updateSaberThrow(dt);
   updateLightning(dt);
   updateForceWave(dt);
+  updateSaberTrail(dt);
   updateCamera(dt);
   updateAtmosphere(dt);
 
   if(p.attacking) checkSaberHits();
+
+  // Track saber blade tip for trail effect
+  trackSaberTrail(dt);
 
   document.getElementById('hpFill').style.width = Math.max(0,p.hp/p.maxHp*100)+'%';
   document.getElementById('spFill').style.width = (p.sp/p.maxSp*100)+'%';
@@ -1394,43 +1436,57 @@ function updateEnemies(dt, diff){
     const dx = p.x - e.x;
     const dist = Math.abs(dx);
     e.facing = dx>0?1:-1;
+    const isDroid = e.type === 'droid';
 
-    // Clones don't move - they stand still and shoot
-    e.vx *= 0.7;
+    // Recoil decay
+    if(e.armRecoil > 0) e.armRecoil = Math.max(0, e.armRecoil - dt*4);
 
-    // Only fire if player is close enough (within 600px)
-    const fireRange = 600;
+    // Droids walk slowly toward player; clones stand still
+    if(isDroid){
+      // Slow advance, stop in fire range
+      const fireRange = 500;
+      if(dist > fireRange + 50){
+        e.vx = e.facing * G.W * 0.06;
+        e.walkT += dt*4;
+      } else {
+        e.vx *= 0.7;
+      }
+    } else {
+      e.vx *= 0.7;
+    }
+
+    const fireRange = isDroid ? 550 : 600;
     e.sinceFire += dt;
 
     if(e.state === 'wait'){
-      if(dist < fireRange && e.sinceFire > 1.8){
+      const cooldown = isDroid ? 1.4 : 1.8;
+      if(dist < fireRange && e.sinceFire > cooldown){
         e.state = 'raise';
         e.raiseT = 0;
       }
     } else if(e.state === 'raise'){
-      // Raise rifle animation - 1 second telegraph
       e.raiseT += dt;
-      if(e.raiseT >= 1.0){
+      const raiseDur = isDroid ? 0.7 : 1.0;
+      if(e.raiseT >= raiseDur){
         e.state = 'shoot';
-        e.burstCount = 3;
+        e.burstCount = isDroid ? 4 : 3;
         e.burstDelay = 0.05;
       }
     } else if(e.state === 'shoot'){
       e.burstDelay -= dt;
       if(e.burstDelay <= 0 && e.burstCount > 0){
-        fireBolt(e, e.burstCount === 3);
+        fireBolt(e, e.burstCount === (isDroid?4:3));
         e.burstCount--;
-        e.burstDelay = 0.32; // slower between shots
+        e.burstDelay = isDroid ? 0.22 : 0.32;
+        e.armRecoil = 1;
       }
       if(e.burstCount <= 0 && e.burstDelay <= -0.4){
         e.state = 'wait';
         e.sinceFire = 0;
-        // Sometimes change crouch state
-        if(Math.random() < 0.3) e.crouching = !e.crouching;
+        if(!isDroid && Math.random() < 0.3) e.crouching = !e.crouching;
       }
     }
 
-    // Gravity
     e.vy += 2200*dt;
     e.x += e.vx*dt;
     e.y += e.vy*dt;
@@ -1445,9 +1501,33 @@ function updateEnemies(dt, diff){
 
 function fireBolt(e, inaccurate){
   const p = G.player;
-  const muzzleOffsetY = e.crouching ? -e.h*0.4 : -e.h*0.55;
-  const sx = e.x + e.facing*e.w*0.7;
-  const sy = e.y + muzzleOffsetY;
+  const isDroid = e.type === 'droid';
+  const f = e.facing;
+  const h = e.h;
+  // Get muzzle world position - matches the visual rifle/arm position
+  let sx, sy;
+  if(isDroid){
+    // B2 fires from forearm
+    const torsoY = -h*0.78;
+    const shoulderY = torsoY + h*0.08;
+    // Forearm extended forward when shooting
+    const forearmX = h*0.45*f;
+    const forearmY = shoulderY + h*0.05;
+    sx = e.x + forearmX;
+    sy = e.y + forearmY;
+  } else {
+    // Clone fires from rifle muzzle
+    const crouchOff = e.crouching ? h*0.20 : 0;
+    const torsoY = -h*0.42 - h*0.30 + crouchOff;
+    const shoulderY = torsoY + h*0.04;
+    // Rifle aimed horizontal during shoot
+    const handX = h*0.18*f + Math.cos(0)*h*0.28*1.1*f;
+    const handY = shoulderY + h*0.05;
+    const muzzleX = handX + h*0.45*f;
+    const muzzleY = handY;
+    sx = e.x + muzzleX;
+    sy = e.y + muzzleY;
+  }
   let tx = p.x, ty = p.y - p.h*0.5;
   if(inaccurate){
     tx += (Math.random()-0.5)*120;
@@ -1455,25 +1535,25 @@ function fireBolt(e, inaccurate){
   }
   const dx=tx-sx, dy=ty-sy;
   const d = Math.hypot(dx,dy);
-  // SLOWER bolts - more reactive
   const speed = G.W*0.45 + Math.min(G.distance,2000)*0.03;
   G.bolts.push({
     x:sx, y:sy,
     vx: dx/d*speed, vy: dy/d*speed,
     life: 3.5,
-    color:'#ff2222',
+    color:'#33aaff',  // BLUE blaster bolts
+    coreColor:'#ffffff',
     fromEnemy:true,
     len: G.H*0.06
   });
   Audio.pew();
-  // Muzzle flash particle
+  // Muzzle flash particles - blue/white tinged
   for(let i=0;i<3;i++){
     G.particles.push({
       x:sx, y:sy,
-      vx: e.facing*200 + (Math.random()-0.5)*100,
+      vx: f*200 + (Math.random()-0.5)*100,
       vy: (Math.random()-0.5)*100,
       life:0.08, max:0.08,
-      color:'#ffaa00', size:4+Math.random()*3,
+      color: i===0?'#ffffff':'#88ccff', size:4+Math.random()*3,
       type:'spark'
     });
   }
@@ -1502,39 +1582,40 @@ function updateBolts(dt){
             b.vx = Math.cos(ang) * speed * 1.1;
             b.vy = Math.sin(ang) * speed * 1.1;
             b.fromEnemy=false;
-            b.color='#44ff44';
+            // Reflected blue bolts - brighter cyan
+            b.color='#88ddff';
+            b.coreColor='#ffffff';
             G.player.sp = Math.min(p.maxSp, p.sp + 5);
           } else {
             // After 1s: reflect with random ±45° spread
             const baseAng = Math.atan2(-b.vy, -b.vx);
-            const spread = (Math.random() - 0.5) * Math.PI * 0.5; // ±45°
+            const spread = (Math.random() - 0.5) * Math.PI * 0.5;
             const ang = baseAng + spread;
             const speed = Math.hypot(b.vx, b.vy);
             b.vx = Math.cos(ang) * speed * 0.9;
             b.vy = Math.sin(ang) * speed * 0.9;
             b.fromEnemy=false;
-            b.color='#88ff88';
+            b.color='#88ddff';
+            b.coreColor='#ffffff';
           }
           continue;
         }
       }
-      // Hit detection
       if(p.invuln<=0){
         const dx=b.x-p.x, dy=b.y-(p.y-p.h*0.5);
         if(Math.abs(dx)<p.w*0.7 && Math.abs(dy)<p.h*0.5){
-          // If blocking from wrong side - still get hit
           damagePlayer(12);
           spawnSparks(b.x,b.y,'#ff8800',10);
           G.bolts.splice(i,1); continue;
         }
       }
-      // Sword sweep auto-block
       if(p.attacking){
         const dx=b.x-p.x, dy=b.y-(p.y-p.h*0.5);
         if(Math.abs(dx)<p.w*1.5 && Math.abs(dy)<p.h*0.8){
           spawnSparks(b.x,b.y,p.jedi.color,6);
           Audio.saberClash();
-          b.vx = -b.vx; b.fromEnemy=false; b.color=p.jedi.color;
+          b.vx = -b.vx; b.fromEnemy=false;
+          b.color='#88ddff'; b.coreColor='#ffffff';
         }
       }
     } else if(!b.fromEnemy){
@@ -1542,7 +1623,17 @@ function updateBolts(dt){
         if(e.dead) continue;
         const dx=b.x-e.x, dy=b.y-(e.y-e.h*0.5);
         if(Math.abs(dx)<e.w*0.8 && Math.abs(dy)<e.h*0.6){
-          killEnemy(e, b.vx*0.5, -200);
+          if(e.type === 'droid'){
+            e.hp--;
+            spawnSparks(b.x,b.y,'#88ccff',12);
+            // metal hit sound
+            Audio.saberClash();
+            if(e.hp <= 0){
+              killEnemy(e, b.vx*0.5, -200);
+            }
+          } else {
+            killEnemy(e, b.vx*0.5, -200);
+          }
           G.bolts.splice(i,1);
           break;
         }
@@ -1570,6 +1661,14 @@ function killEnemy(e, vx, vy){
   if(e.dead) return;
   e.dead = true;
   G.kills++;
+  if(e.type === 'droid'){
+    // Droid explodes - red puff cloud like in Tartakovsky
+    spawnDroidExplosion(e.x, e.y - e.h*0.5);
+    cameraShake(8, 0.25);
+    Audio.forceBoom();
+    // Don't add body - droid is destroyed in explosion
+    return;
+  }
   const variant = Math.floor(Math.random()*3);
   G.bodies.push({
     x:e.x, y:e.y - e.h*0.5,
@@ -1585,6 +1684,50 @@ function killEnemy(e, vx, vy){
   Audio.cloneDie();
 }
 
+function spawnDroidExplosion(x, y){
+  // Tartakovsky-style red/orange puff explosion
+  G.explosions.push({
+    x, y, r:0, maxR: G.H*0.18, life: 0.6, max:0.6
+  });
+  // Debris streaks
+  for(let i=0;i<8;i++){
+    const a = Math.random()*Math.PI*2;
+    const sp = 200+Math.random()*300;
+    G.particles.push({
+      x, y,
+      vx: Math.cos(a)*sp,
+      vy: Math.sin(a)*sp - 100,
+      life: 0.6+Math.random()*0.4, max:1.0,
+      color: '#aa2211', size: 4+Math.random()*4,
+      type:'debris', trail:true
+    });
+  }
+  // Smoke puffs
+  for(let i=0;i<12;i++){
+    const a = Math.random()*Math.PI*2;
+    const sp = 60+Math.random()*120;
+    G.particles.push({
+      x: x+(Math.random()-0.5)*30,
+      y: y+(Math.random()-0.5)*30,
+      vx: Math.cos(a)*sp,
+      vy: Math.sin(a)*sp - 50,
+      life: 0.8+Math.random()*0.4, max:1.2,
+      color: i<4?'#cc3322':'#552211',
+      size: 10+Math.random()*8,
+      type:'puff'
+    });
+  }
+  // Bright initial flash
+  for(let i=0;i<5;i++){
+    G.particles.push({
+      x, y,
+      vx:(Math.random()-0.5)*200, vy:(Math.random()-0.5)*200,
+      life:0.15, max:0.15,
+      color:'#ffee88', size:8+Math.random()*6, type:'spark'
+    });
+  }
+}
+
 function checkSaberHits(){
   const p = G.player;
   // BIGGER hitbox - longer reach
@@ -1594,12 +1737,75 @@ function checkSaberHits(){
     const dx=e.x-p.x, dy=e.y-e.h*0.5 - (p.y-p.h*0.5);
     const d = Math.hypot(dx,dy);
     if(d < reach && Math.sign(dx)===p.facing){
-      killEnemy(e, p.facing*400, -250);
+      if(e.type === 'droid'){
+        e.hp -= 2; // saber cuts droids fast
+        spawnSparks(e.x, e.y - e.h*0.5, '#88ccff', 8);
+        if(e.hp <= 0) killEnemy(e, p.facing*400, -250);
+      } else {
+        killEnemy(e, p.facing*400, -250);
+      }
     }
-    // Also hit slightly behind for whirlwind-like coverage during thrust
     if(p.attackCombo === 2 && d < reach*0.9 && Math.abs(dx) < reach){
-      killEnemy(e, p.facing*500, -200);
+      if(e.type === 'droid'){
+        e.hp -= 2;
+        if(e.hp <= 0) killEnemy(e, p.facing*500, -200);
+      } else {
+        killEnemy(e, p.facing*500, -200);
+      }
     }
+  }
+}
+
+function getSaberTipWorld(p){
+  // Compute blade tip in world coordinates - matches drawing math
+  const h = p.h;
+  const f = p.facing;
+  const torsoH = h*0.32;
+  const legLen = h*0.40;
+  const shoulderX = h*0.15*f;
+  const shoulderY = -legLen - torsoH*0.55;
+  const armLen = h*0.32;
+  const handDist = armLen*0.6;
+  const handX = shoulderX + Math.cos(p.saberAngle)*handDist*0.5;
+  const handY = shoulderY + Math.sin(p.saberAngle)*handDist*0.5;
+  const hiltLen = h*0.14;
+  const bladeLen = h*1.0;
+  const hiltEndX = handX + Math.cos(p.saberAngle)*hiltLen;
+  const hiltEndY = handY + Math.sin(p.saberAngle)*hiltLen;
+  const tipX = hiltEndX + Math.cos(p.saberAngle)*bladeLen;
+  const tipY = hiltEndY + Math.sin(p.saberAngle)*bladeLen;
+  return {
+    x: p.x + tipX,
+    y: p.y + tipY,
+    midX: p.x + hiltEndX + Math.cos(p.saberAngle)*bladeLen*0.5,
+    midY: p.y + hiltEndY + Math.sin(p.saberAngle)*bladeLen*0.5
+  };
+}
+
+function trackSaberTrail(dt){
+  const p = G.player;
+  if(!p.saberOn || p.dead) return;
+  const tip = getSaberTipWorld(p);
+  // Always track but add intensity for fast movement / attacks
+  let intensity = 0.5;
+  if(p.attacking) intensity = 1.0;
+  else if(p.whirl > 0) intensity = 1.0;
+  else if(Math.abs(p.vx) > G.W*0.15) intensity = 0.7;
+  G.saberTrail.push({
+    x: tip.x, y: tip.y,
+    midX: tip.midX, midY: tip.midY,
+    life: 0.18, max: 0.18,
+    intensity,
+    color: p.jedi.color
+  });
+  // Cap trail length
+  if(G.saberTrail.length > 20) G.saberTrail.shift();
+}
+
+function updateSaberTrail(dt){
+  for(let i=G.saberTrail.length-1;i>=0;i--){
+    G.saberTrail[i].life -= dt;
+    if(G.saberTrail[i].life <= 0) G.saberTrail.splice(i,1);
   }
 }
 
@@ -1741,10 +1947,31 @@ function updateParticles(dt){
   for(let i=G.particles.length-1;i>=0;i--){
     const p=G.particles[i];
     p.x += p.vx*dt; p.y += p.vy*dt;
-    p.vy += (p.type==='smoke'?-50:600)*dt;
-    p.vx *= 0.95;
+    if(p.type==='puff'){
+      p.vy += -30*dt;
+      p.vx *= 0.92;
+      p.size += dt*15;
+    } else if(p.type==='debris'){
+      p.vy += 1200*dt;
+      p.vx *= 0.98;
+    } else if(p.type==='smoke'){
+      p.vy += -50*dt;
+      p.vx *= 0.95;
+    } else {
+      p.vy += 600*dt;
+      p.vx *= 0.95;
+    }
     p.life -= dt;
     if(p.life<=0) G.particles.splice(i,1);
+  }
+}
+function updateExplosions(dt){
+  for(let i=G.explosions.length-1;i>=0;i--){
+    const e = G.explosions[i];
+    e.life -= dt;
+    e.r += dt * (e.maxR / 0.3);
+    if(e.r > e.maxR) e.r = e.maxR;
+    if(e.life <= 0) G.explosions.splice(i,1);
   }
 }
 function updateBodies(dt){
@@ -1963,6 +2190,7 @@ function renderMain(sx,sy){
 
   for(const b of G.bodies) drawBody(ctx,b);
   for(const e of G.enemies) drawClone(ctx,e);
+  drawSaberTrail(ctx);
   if(G.player) drawJedi(ctx, G.player);
   for(const b of G.bolts) drawBolt(ctx,b);
   if(G.saberThrow) drawSaberThrow(ctx, G.saberThrow);
@@ -2075,7 +2303,20 @@ function drawJedi(ctx, p){
   ctx.save();
   if(blink) ctx.globalAlpha = 0.5;
 
-  ctx.translate(sx, sy);
+  // Stab thrust: translate body forward briefly
+  let stabOffset = 0;
+  if(p.attacking && p.attackCombo === 2 && p._stabT){
+    // Body lunges forward during thrust portion (t > 0.3)
+    const t = p._stabT;
+    if(t > 0.3 && t < 0.7){
+      stabOffset = ((t - 0.3) / 0.4) * p.h * 0.18 * p.facing;
+    } else if(t >= 0.7){
+      // Pull back
+      stabOffset = ((1 - t) / 0.3) * p.h * 0.18 * p.facing;
+    }
+  }
+
+  ctx.translate(sx + stabOffset, sy);
 
   // Whirlwind trail
   if(p.whirl > 0){
@@ -2128,40 +2369,99 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
 
   const f = facing;
 
-  // === LEGS ===
-  const legSwing = Math.sin(runT)*0.3;
-  const legX = h*0.06;
-  ctx.lineWidth = h*0.09;
+  // === RUNNING ANIMATION ===
+  // 4-phase running: phase 0=front leg up, 1=passing, 2=back leg up, 3=passing
+  // Use sin/cos for smooth interpolation
+  const runPhase = runT;
+  const isRunning = !dead && Math.abs(runT) > 0.01 && (Math.sin(runT*1000) || true); // we increment runT externally
+  const legAmp = h*0.18;
+  const armAmp = 0.5;
+
+  // Front leg cycles forward/back
+  const frontLegLift = Math.max(0, Math.sin(runPhase)) * legAmp;
+  const frontLegFwd = Math.sin(runPhase) * h*0.10;
+  // Back leg opposite phase
+  const backLegLift = Math.max(0, Math.sin(runPhase + Math.PI)) * legAmp;
+  const backLegFwd = Math.sin(runPhase + Math.PI) * h*0.10;
+
+  // Body bob (up when both feet pass)
+  const bodyBob = Math.abs(Math.sin(runPhase*2)) * h*0.025;
+
+  ctx.translate(0, -bodyBob);
+
+  // === BACK LEG (drawn first - behind) ===
+  ctx.lineWidth = h*0.10;
+  ctx.strokeStyle = robeDark;
+  const backHipX = -h*0.05*f;
+  const backFootX = backHipX - backLegFwd*f;
+  const backFootY = -backLegLift;
+  const backKneeX = (backHipX + backFootX) / 2 - f*h*0.03;
+  const backKneeY = -legLen*0.5 - backLegLift*0.3;
+
+  // Outline
+  ctx.lineWidth = h*0.10 + 4;
+  ctx.strokeStyle = '#000';
+  ctx.beginPath();
+  ctx.moveTo(backHipX, -legLen);
+  ctx.quadraticCurveTo(backKneeX, backKneeY, backFootX, backFootY);
+  ctx.stroke();
+  // Pant color
+  ctx.lineWidth = h*0.10;
   ctx.strokeStyle = robeDark;
   ctx.beginPath();
-  ctx.moveTo(-legX*f, -legLen);
-  ctx.lineTo(-legX*f - legSwing*h*0.3*f, -legLen*0.5 - Math.abs(legSwing)*h*0.1);
-  ctx.lineTo(-legX*f, 0);
+  ctx.moveTo(backHipX, -legLen);
+  ctx.quadraticCurveTo(backKneeX, backKneeY, backFootX, backFootY);
   ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(legX*f, -legLen);
-  ctx.lineTo(legX*f + legSwing*h*0.3*f, -legLen*0.5 - Math.abs(legSwing)*h*0.1);
-  ctx.lineTo(legX*f + legSwing*h*0.1*f, 0);
-  ctx.stroke();
-  // Boots
+  // Boot
   ctx.fillStyle = '#2a1810';
-  ctx.fillRect(-legX*f - h*0.06, -h*0.04, h*0.14, h*0.05);
-  ctx.fillRect(legX*f - h*0.06 + legSwing*h*0.1*f, -h*0.04, h*0.14, h*0.05);
-  ctx.strokeStyle = black;
-  ctx.lineWidth = 2;
-  ctx.strokeRect(-legX*f - h*0.06, -h*0.04, h*0.14, h*0.05);
-  ctx.strokeRect(legX*f - h*0.06 + legSwing*h*0.1*f, -h*0.04, h*0.14, h*0.05);
+  ctx.beginPath();
+  ctx.ellipse(backFootX + f*h*0.03, backFootY + h*0.01, h*0.08, h*0.035, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle=black; ctx.lineWidth=2; ctx.stroke();
 
-  // === ROBE skirt ===
+  // === ROBE skirt (between legs) ===
   ctx.fillStyle = robeC;
   ctx.beginPath();
   ctx.moveTo(-h*0.18, -legLen + h*0.05);
   ctx.lineTo(h*0.18, -legLen + h*0.05);
-  ctx.lineTo(h*0.24, 0);
-  ctx.lineTo(-h*0.24, 0);
+  ctx.lineTo(h*0.24, -h*0.05);
+  ctx.lineTo(-h*0.24, -h*0.05);
   ctx.closePath();
   ctx.fill();
   ctx.strokeStyle = black; ctx.lineWidth = 2; ctx.stroke();
+  // Robe fold lines
+  ctx.beginPath();
+  ctx.moveTo(-h*0.08, -legLen + h*0.07);
+  ctx.lineTo(-h*0.10, -h*0.05);
+  ctx.moveTo(h*0.06, -legLen + h*0.06);
+  ctx.lineTo(h*0.08, -h*0.05);
+  ctx.stroke();
+
+  // === FRONT LEG ===
+  const frontHipX = h*0.05*f;
+  const frontFootX = frontHipX + frontLegFwd*f;
+  const frontFootY = -frontLegLift;
+  const frontKneeX = (frontHipX + frontFootX) / 2 + f*h*0.04;
+  const frontKneeY = -legLen*0.5 - frontLegLift*0.3;
+
+  ctx.lineWidth = h*0.10 + 4;
+  ctx.strokeStyle = '#000';
+  ctx.beginPath();
+  ctx.moveTo(frontHipX, -legLen);
+  ctx.quadraticCurveTo(frontKneeX, frontKneeY, frontFootX, frontFootY);
+  ctx.stroke();
+  ctx.lineWidth = h*0.10;
+  ctx.strokeStyle = robeDark;
+  ctx.beginPath();
+  ctx.moveTo(frontHipX, -legLen);
+  ctx.quadraticCurveTo(frontKneeX, frontKneeY, frontFootX, frontFootY);
+  ctx.stroke();
+  // Front boot
+  ctx.fillStyle = '#2a1810';
+  ctx.beginPath();
+  ctx.ellipse(frontFootX + f*h*0.03, frontFootY + h*0.01, h*0.08, h*0.035, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle=black; ctx.lineWidth=2; ctx.stroke();
 
   // === TORSO - tunic ===
   const torsoY = -legLen - torsoH*0.5;
@@ -2181,7 +2481,7 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
   ctx.fillStyle = '#aaaa44';
   ctx.fillRect(-h*0.03, -legLen - h*0.005, h*0.06, h*0.04);
 
-  // Robe shoulders/cape
+  // Robe shoulders
   ctx.fillStyle = robeC;
   ctx.beginPath();
   ctx.moveTo(-h*0.20, -legLen - torsoH*0.65);
@@ -2191,36 +2491,57 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
-  // Cape behind (only on facing side back)
+
+  // Cape behind
   ctx.fillStyle = robeDark;
+  // Cape sways with movement
+  const capeSway = Math.sin(runPhase*2) * h*0.05;
   ctx.beginPath();
   ctx.moveTo(-h*0.20*f, -legLen - torsoH*0.65);
   ctx.lineTo(-h*0.10*f, -legLen - torsoH*0.65);
-  ctx.lineTo(-h*0.30*f, -legLen + h*0.10);
-  ctx.lineTo(-h*0.40*f, 0);
-  ctx.lineTo(-h*0.45*f, -h*0.02);
+  ctx.lineTo(-h*0.30*f + capeSway*f, -legLen + h*0.10);
+  ctx.lineTo(-h*0.40*f + capeSway*f*1.5, -h*0.05);
+  ctx.lineTo(-h*0.45*f + capeSway*f*2, -h*0.02);
   ctx.closePath();
   ctx.fill();
   ctx.strokeStyle = black; ctx.lineWidth = 2; ctx.stroke();
 
-  // === BACK ARM (no saber) ===
-  ctx.lineWidth = h*0.07;
-  ctx.strokeStyle = tunicC;
-  const armSwingBack = Math.sin(runT+Math.PI)*0.15;
+  // === BACK ARM (no saber) - swings opposite to back leg ===
+  // Arm swings opposite to its same-side leg
+  const backArmAng = -Math.cos(runPhase) * armAmp;
+  const backShoulderX = -h*0.15*f;
+  const backShoulderY = -legLen - torsoH*0.5;
+  const backElbowX = backShoulderX + Math.sin(backArmAng)*h*0.12*f;
+  const backElbowY = backShoulderY + h*0.16 + Math.cos(backArmAng)*h*0.05;
+  const backHandX = backShoulderX + Math.sin(backArmAng)*h*0.22*f;
+  const backHandY = backShoulderY + h*0.30 + Math.cos(backArmAng)*h*0.10;
+
+  // Outline
+  ctx.lineWidth = h*0.07 + 4;
+  ctx.strokeStyle = black;
   ctx.beginPath();
-  ctx.moveTo(-h*0.15*f, -legLen - torsoH*0.5);
-  ctx.lineTo(-h*0.15*f - h*0.05*f, -legLen - torsoH*0.2 + armSwingBack*h*0.1);
-  ctx.lineTo(-h*0.10*f, -legLen + h*0.04);
+  ctx.moveTo(backShoulderX, backShoulderY);
+  ctx.lineTo(backElbowX, backElbowY);
+  ctx.lineTo(backHandX, backHandY);
   ctx.stroke();
-  ctx.strokeStyle = robeC;
+  // Tunic sleeve
   ctx.lineWidth = h*0.05;
+  ctx.strokeStyle = robeC;
   ctx.beginPath();
-  ctx.moveTo(-h*0.15*f, -legLen - torsoH*0.5);
-  ctx.lineTo(-h*0.15*f - h*0.05*f, -legLen - torsoH*0.25 + armSwingBack*h*0.1);
+  ctx.moveTo(backShoulderX, backShoulderY);
+  ctx.lineTo(backElbowX, backElbowY);
   ctx.stroke();
+  // Forearm (skin)
+  ctx.lineWidth = h*0.06;
+  ctx.strokeStyle = tunicC;
+  ctx.beginPath();
+  ctx.moveTo(backElbowX, backElbowY);
+  ctx.lineTo(backHandX, backHandY);
+  ctx.stroke();
+  // Hand
   ctx.fillStyle = skinC;
   ctx.beginPath();
-  ctx.arc(-h*0.10*f, -legLen + h*0.04, h*0.025, 0, Math.PI*2);
+  ctx.arc(backHandX, backHandY, h*0.025, 0, Math.PI*2);
   ctx.fill();
   ctx.strokeStyle=black; ctx.lineWidth=1.5; ctx.stroke();
 
@@ -2233,7 +2554,8 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
   const headY = -legLen - torsoH*0.55 - neckLen - headR;
   ctx.save();
   ctx.translate(0, headY);
-  // Long pointed face
+  // Head bob slight tilt with run
+  ctx.rotate(Math.sin(runPhase*2) * 0.04);
   ctx.fillStyle = skinC;
   ctx.beginPath();
   ctx.moveTo(-headR*0.7, -headR);
@@ -2248,9 +2570,7 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
   ctx.fill();
   ctx.strokeStyle=black; ctx.lineWidth=2; ctx.stroke();
 
-  // Head feature based on jedi
   if(jedi.skin.hair==='lekku'){
-    // Aayla's lekku (twin head-tails)
     ctx.fillStyle = skinC;
     ctx.beginPath();
     ctx.moveTo(-headR*0.7, -headR*0.95);
@@ -2269,13 +2589,11 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
       ctx.stroke();
     }
     ctx.strokeStyle = black;
-    // headband
     ctx.fillStyle='#5a3020';
     ctx.fillRect(-headR*0.8, -headR*0.7, headR*1.6, headR*0.18);
     ctx.strokeStyle=black; ctx.lineWidth=1.5;
     ctx.strokeRect(-headR*0.8, -headR*0.7, headR*1.6, headR*0.18);
   } else if(jedi.skin.hair==='mask'){
-    // Plo Koon mask
     ctx.fillStyle='#aa9988';
     ctx.beginPath();
     ctx.moveTo(-headR*0.5, -headR*0.2);
@@ -2285,7 +2603,6 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
     ctx.lineTo(-headR*0.85, headR*0.1);
     ctx.closePath();
     ctx.fill(); ctx.stroke();
-    // Goggles
     ctx.fillStyle='#000';
     ctx.beginPath();
     ctx.ellipse(-headR*0.25, -headR*0.3, headR*0.25, headR*0.15, 0, 0, Math.PI*2);
@@ -2301,9 +2618,7 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
     ctx.ellipse(headR*0.3, -headR*0.35, headR*0.05, headR*0.03, 0, 0, Math.PI*2);
     ctx.fill();
   } else if(jedi.skin.hair==='bun'){
-    // Bastila Shan: hair bun + side strands
     ctx.fillStyle='#5a3020';
-    // Hair on head
     ctx.beginPath();
     ctx.moveTo(-headR*0.85, -headR*0.95);
     ctx.lineTo(headR*0.85, -headR*0.95);
@@ -2313,11 +2628,9 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
     ctx.lineTo(-headR*0.95, -headR*0.2);
     ctx.closePath();
     ctx.fill(); ctx.stroke();
-    // Bun on top
     ctx.beginPath();
     ctx.ellipse(0, -headR*1.15, headR*0.45, headR*0.25, 0, 0, Math.PI*2);
     ctx.fill(); ctx.stroke();
-    // Two side ponytails (Bastila signature)
     ctx.fillStyle='#5a3020';
     ctx.beginPath();
     ctx.moveTo(-headR*0.85, -headR*0.5);
@@ -2337,12 +2650,10 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
     ctx.fill(); ctx.stroke();
   }
 
-  // Eyes
   if(jedi.skin.hair!=='mask'){
     ctx.fillStyle = jedi.skin.eyes || black;
     ctx.fillRect(-headR*0.4 + (f>0?headR*0.1:0), -headR*0.2, headR*0.18, headR*0.08);
     ctx.fillRect(headR*0.18 + (f>0?headR*0.1:0), -headR*0.2, headR*0.18, headR*0.08);
-    // Mouth
     ctx.strokeStyle=black; ctx.lineWidth=2;
     ctx.beginPath();
     ctx.moveTo(headR*0.05*f, headR*0.2);
@@ -2354,20 +2665,23 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
   // === FRONT ARM with SABER ===
   const shoulderX = h*0.15*f;
   const shoulderY = -legLen - torsoH*0.55;
-
-  // Two-handed grip when blocking or for double saber
   const isDouble = jedi.special === 'whirl';
-  const isBlock = blocking;
-
   const armLen = h*0.32;
-  // Hand grips at hilt position - calculate based on saber angle
   const handDist = armLen*0.6;
   const handX = shoulderX + Math.cos(saberAng)*handDist*0.5;
   const handY = shoulderY + Math.sin(saberAng)*handDist*0.5;
-  // Elbow naturally bends
   const elbowX = shoulderX + Math.cos(saberAng - 0.6*f)*armLen*0.45;
   const elbowY = shoulderY + Math.sin(saberAng - 0.6*f)*armLen*0.45 + h*0.04;
 
+  // Outline
+  ctx.lineWidth = h*0.07 + 4;
+  ctx.strokeStyle = black;
+  ctx.beginPath();
+  ctx.moveTo(shoulderX, shoulderY);
+  ctx.lineTo(elbowX, elbowY);
+  ctx.lineTo(handX, handY);
+  ctx.stroke();
+  // Tunic sleeve
   ctx.lineWidth = h*0.07;
   ctx.strokeStyle = tunicC;
   ctx.beginPath();
@@ -2376,17 +2690,14 @@ function drawJediBody(ctx, jedi, h, facing, saberAng, dead, runT, saberOn, block
   ctx.lineTo(handX, handY);
   ctx.stroke();
 
-  // Hand
   ctx.fillStyle = skinC;
   ctx.beginPath();
   ctx.arc(handX, handY, h*0.035, 0, Math.PI*2);
   ctx.fill();
   ctx.strokeStyle=black; ctx.lineWidth=1.5; ctx.stroke();
 
-  // === SABER ===
   if(saberOn){
     drawSaber(ctx, handX, handY, saberAng, h, jedi.color, hiltC);
-    // Double-bladed for Bastila
     if(isDouble){
       drawSaber(ctx, handX, handY, saberAng + Math.PI, h, jedi.color, hiltC, true);
     }
@@ -2445,169 +2756,331 @@ function drawSaber(ctx, hx, hy, ang, h, color, hiltC, isBackBlade){
   ctx.globalAlpha = 1;
 }
 
+function drawSaberTrail(ctx){
+  if(G.saberTrail.length < 2) return;
+  ctx.save();
+  for(let i=1; i<G.saberTrail.length; i++){
+    const a = G.saberTrail[i-1];
+    const b = G.saberTrail[i];
+    const aF = a.life / a.max;
+    const bF = b.life / b.max;
+    const avgF = (aF + bF) / 2;
+    const intensity = (a.intensity + b.intensity) / 2;
+    // Outer glow
+    ctx.strokeStyle = a.color;
+    ctx.globalAlpha = avgF * 0.18 * intensity;
+    ctx.lineWidth = 28 * avgF;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(a.x - G.scrollX, a.y);
+    ctx.lineTo(b.x - G.scrollX, b.y);
+    ctx.stroke();
+    // Mid
+    ctx.globalAlpha = avgF * 0.35 * intensity;
+    ctx.lineWidth = 14 * avgF;
+    ctx.stroke();
+    // Core white-hot
+    ctx.strokeStyle = '#ffffff';
+    ctx.globalAlpha = avgF * 0.5 * intensity;
+    ctx.lineWidth = 4 * avgF;
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
 /* ============================================================
    CLONE - Phase 1 trooper, can crouch, raise rifle
    ============================================================ */
 function drawClone(ctx, e){
+  if(e.type === 'droid'){
+    drawB2Droid(ctx, e);
+    return;
+  }
   const sx = e.x - G.scrollX;
   const sy = e.y;
   const h = e.h;
   const f = e.facing;
   const isCmd = e.type==='commander';
-  const armorWhite = '#f0f0f0';
-  const armorShade = '#888';
-  const accent = isCmd ? '#cc2222' : '#666';
+  const armorWhite = '#f4f4f4';
+  const armorShade = '#9a9a9a';
+  const armorDark = '#555';
+  const accent = isCmd ? '#cc1f1f' : '#3a3a3a';
 
   ctx.save();
   ctx.translate(sx, sy);
 
   const crouch = e.crouching;
-  const heightMul = crouch ? 0.75 : 1.0;
+  const heightMul = crouch ? 0.78 : 1.0;
   const legLen = h * 0.42 * heightMul;
 
-  // Legs - if crouching, bent
-  ctx.lineWidth = h*0.10;
-  ctx.strokeStyle = armorWhite;
+  // === LEGS - chunky armor ===
+  // Back leg
+  ctx.fillStyle = armorWhite;
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
   if(crouch){
-    // Bent legs for crouch
+    // Bent thigh
     ctx.beginPath();
-    ctx.moveTo(-h*0.10*f, -legLen);
-    ctx.lineTo(-h*0.18*f, -legLen*0.5);
-    ctx.lineTo(-h*0.06*f, 0);
-    ctx.stroke();
+    ctx.moveTo(-h*0.05*f - h*0.05, -legLen);
+    ctx.lineTo(-h*0.05*f + h*0.05, -legLen);
+    ctx.lineTo(-h*0.18*f + h*0.05, -legLen*0.5);
+    ctx.lineTo(-h*0.18*f - h*0.05, -legLen*0.5);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // Shin
     ctx.beginPath();
-    ctx.moveTo(h*0.10*f, -legLen);
-    ctx.lineTo(h*0.18*f, -legLen*0.5);
-    ctx.lineTo(h*0.10*f, 0);
-    ctx.stroke();
+    ctx.moveTo(-h*0.18*f - h*0.05, -legLen*0.5);
+    ctx.lineTo(-h*0.18*f + h*0.05, -legLen*0.5);
+    ctx.lineTo(-h*0.06*f + h*0.06, 0);
+    ctx.lineTo(-h*0.06*f - h*0.06, 0);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+  } else {
+    // Straight thigh + shin
+    ctx.beginPath();
+    ctx.moveTo(-h*0.06*f - h*0.05, -legLen);
+    ctx.lineTo(-h*0.06*f + h*0.05, -legLen);
+    ctx.lineTo(-h*0.06*f + h*0.06, 0);
+    ctx.lineTo(-h*0.06*f - h*0.06, 0);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // Knee plate
+    ctx.fillStyle = armorShade;
+    ctx.fillRect(-h*0.06*f - h*0.05, -legLen*0.55 - h*0.02, h*0.10, h*0.05);
+    ctx.strokeRect(-h*0.06*f - h*0.05, -legLen*0.55 - h*0.02, h*0.10, h*0.05);
+  }
+  // Back boot
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(-h*0.06*f - h*0.07, -h*0.04, h*0.16, h*0.05);
+  ctx.strokeRect(-h*0.06*f - h*0.07, -h*0.04, h*0.16, h*0.05);
+
+  // Front leg (foreground, slightly forward)
+  ctx.fillStyle = armorWhite;
+  if(crouch){
+    ctx.beginPath();
+    ctx.moveTo(h*0.05*f - h*0.05, -legLen);
+    ctx.lineTo(h*0.05*f + h*0.05, -legLen);
+    ctx.lineTo(h*0.18*f + h*0.05, -legLen*0.5);
+    ctx.lineTo(h*0.18*f - h*0.05, -legLen*0.5);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(h*0.18*f - h*0.05, -legLen*0.5);
+    ctx.lineTo(h*0.18*f + h*0.05, -legLen*0.5);
+    ctx.lineTo(h*0.10*f + h*0.06, 0);
+    ctx.lineTo(h*0.10*f - h*0.06, 0);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
   } else {
     ctx.beginPath();
-    ctx.moveTo(-h*0.06*f, -legLen);
-    ctx.lineTo(-h*0.06*f, -legLen*0.5);
-    ctx.lineTo(-h*0.06*f, 0);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(h*0.06*f, -legLen);
-    ctx.lineTo(h*0.06*f, -legLen*0.5);
-    ctx.lineTo(h*0.06*f, 0);
-    ctx.stroke();
+    ctx.moveTo(h*0.06*f - h*0.05, -legLen);
+    ctx.lineTo(h*0.06*f + h*0.05, -legLen);
+    ctx.lineTo(h*0.08*f + h*0.06, 0);
+    ctx.lineTo(h*0.08*f - h*0.06, 0);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = armorShade;
+    ctx.fillRect(h*0.06*f - h*0.05, -legLen*0.55 - h*0.02, h*0.10, h*0.05);
+    ctx.strokeRect(h*0.06*f - h*0.05, -legLen*0.55 - h*0.02, h*0.10, h*0.05);
   }
-  ctx.fillStyle = armorShade;
-  ctx.fillRect(-h*0.10, -legLen*0.55, h*0.06, h*0.04);
-  ctx.fillRect(h*0.04, -legLen*0.55, h*0.06, h*0.04);
-  ctx.fillStyle = '#222';
-  ctx.fillRect(-h*0.06*f - h*0.06, -h*0.03, h*0.13, h*0.04);
-  ctx.fillRect(h*0.06*f - h*0.06, -h*0.03, h*0.13, h*0.04);
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(h*0.08*f - h*0.07, -h*0.04, h*0.16, h*0.05);
+  ctx.strokeRect(h*0.08*f - h*0.07, -h*0.04, h*0.16, h*0.05);
 
+  // === PELVIS / BELT ===
   const beltY = -legLen;
   ctx.fillStyle = armorWhite;
-  ctx.fillRect(-h*0.16, beltY-h*0.04, h*0.32, h*0.10);
-  ctx.strokeStyle='#000'; ctx.lineWidth=2;
-  ctx.strokeRect(-h*0.16, beltY-h*0.04, h*0.32, h*0.10);
+  ctx.beginPath();
+  ctx.moveTo(-h*0.18, beltY-h*0.06);
+  ctx.lineTo(h*0.18, beltY-h*0.06);
+  ctx.lineTo(h*0.20, beltY+h*0.06);
+  ctx.lineTo(-h*0.20, beltY+h*0.06);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  // Belt buckle area (darker)
   ctx.fillStyle = armorShade;
-  ctx.fillRect(-h*0.06, beltY+h*0.01, h*0.12, h*0.05);
+  ctx.fillRect(-h*0.07, beltY+h*0.0, h*0.14, h*0.06);
+  ctx.strokeRect(-h*0.07, beltY+h*0.0, h*0.14, h*0.06);
 
-  const torsoH = h*0.30;
+  // === TORSO - rounded chestplate, Phase 1 ===
+  const torsoH = h*0.32;
   const torsoY = beltY - torsoH;
+  // Main chest shape (wider at top, tapered to belt)
   ctx.fillStyle = armorWhite;
   ctx.beginPath();
-  ctx.moveTo(-h*0.20, torsoY);
-  ctx.lineTo(h*0.20, torsoY);
-  ctx.lineTo(h*0.18, beltY-h*0.04);
-  ctx.lineTo(-h*0.18, beltY-h*0.04);
+  ctx.moveTo(-h*0.22, torsoY+h*0.04);
+  // Curved top to neck
+  ctx.lineTo(-h*0.18, torsoY-h*0.01);
+  ctx.lineTo(-h*0.06, torsoY-h*0.04);
+  ctx.lineTo(h*0.06, torsoY-h*0.04);
+  ctx.lineTo(h*0.18, torsoY-h*0.01);
+  ctx.lineTo(h*0.22, torsoY+h*0.04);
+  ctx.lineTo(h*0.18, beltY-h*0.06);
+  ctx.lineTo(-h*0.18, beltY-h*0.06);
   ctx.closePath();
-  ctx.fill();
+  ctx.fill(); ctx.stroke();
+
+  // Chest plate divisions (Tartakovsky style - clear lines)
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1.5;
+  // Center line
+  ctx.beginPath();
+  ctx.moveTo(0, torsoY+h*0.04);
+  ctx.lineTo(0, torsoY+h*0.20);
   ctx.stroke();
-  ctx.fillStyle = armorShade;
-  ctx.fillRect(-h*0.12, torsoY+h*0.05, h*0.04, h*0.08);
-  ctx.fillRect(h*0.08, torsoY+h*0.05, h*0.04, h*0.08);
+  // Pectoral curves
+  ctx.beginPath();
+  ctx.moveTo(-h*0.16, torsoY+h*0.04);
+  ctx.quadraticCurveTo(-h*0.10, torsoY+h*0.12, 0, torsoY+h*0.16);
+  ctx.moveTo(h*0.16, torsoY+h*0.04);
+  ctx.quadraticCurveTo(h*0.10, torsoY+h*0.12, 0, torsoY+h*0.16);
+  ctx.stroke();
+  // Lower abdomen line
+  ctx.beginPath();
+  ctx.moveTo(-h*0.16, torsoY+h*0.22);
+  ctx.lineTo(h*0.16, torsoY+h*0.22);
+  ctx.stroke();
+  // Rib lines on sides
+  ctx.beginPath();
+  ctx.moveTo(-h*0.20, torsoY+h*0.10);
+  ctx.lineTo(-h*0.16, torsoY+h*0.16);
+  ctx.moveTo(h*0.20, torsoY+h*0.10);
+  ctx.lineTo(h*0.16, torsoY+h*0.16);
+  ctx.stroke();
+
+  // Commander markings
   if(isCmd){
     ctx.fillStyle = accent;
+    // Top stripe across chest
     ctx.beginPath();
-    ctx.moveTo(-h*0.18, torsoY);
-    ctx.lineTo(h*0.18, torsoY);
-    ctx.lineTo(h*0.10, torsoY+h*0.10);
-    ctx.lineTo(-h*0.10, torsoY+h*0.10);
+    ctx.moveTo(-h*0.18, torsoY-h*0.01);
+    ctx.lineTo(h*0.18, torsoY-h*0.01);
+    ctx.lineTo(h*0.16, torsoY+h*0.05);
+    ctx.lineTo(-h*0.16, torsoY+h*0.05);
     ctx.closePath();
-    ctx.fill(); ctx.stroke();
-    // Pauldron
+    ctx.fill();
+    ctx.strokeStyle='#000'; ctx.lineWidth=1.5; ctx.stroke();
+    // Pauldron (shoulder armor) on back
     ctx.fillStyle = accent;
     ctx.beginPath();
-    ctx.moveTo(-h*0.22*f, torsoY);
-    ctx.lineTo(-h*0.05*f, torsoY-h*0.03);
+    ctx.moveTo(-h*0.24*f, torsoY-h*0.02);
+    ctx.lineTo(-h*0.05*f, torsoY-h*0.05);
     ctx.lineTo(-h*0.10*f, torsoY+h*0.18);
-    ctx.lineTo(-h*0.27*f, torsoY+h*0.15);
+    ctx.lineTo(-h*0.28*f, torsoY+h*0.16);
     ctx.closePath();
     ctx.fill(); ctx.stroke();
   }
 
-  // RIFLE position - based on state
-  let rifleAngle = 0; // 0 = horizontal forward
-  if(e.state === 'wait'){
-    rifleAngle = 0.6; // pointing down/relaxed
-  } else if(e.state === 'raise'){
-    // Smooth interpolation from down to aimed
+  // === RIFLE & ARMS - exact alignment with bolt spawn position ===
+  let rifleAngle = 0;
+  if(e.state === 'wait'){ rifleAngle = 0.6; }
+  else if(e.state === 'raise'){
     const t = e.raiseT / 1.0;
-    rifleAngle = 0.6 - t * 0.6; // from 0.6 to 0
-  } else if(e.state === 'shoot'){
-    rifleAngle = 0; // horizontal aimed
-  }
+    rifleAngle = 0.6 - t * 0.6;
+  } else if(e.state === 'shoot'){ rifleAngle = 0; }
+
+  const recoilOffset = e.armRecoil * h * 0.04 * (-f);
+
+  const shoulderFrontX = h*0.18*f;
+  const shoulderY = torsoY + h*0.04;
+
+  // Hand position - SAME math as fireBolt muzzle calculation
+  const handX = shoulderFrontX + Math.cos(0)*h*0.28*1.1*f + recoilOffset;
+  const handY = shoulderY + Math.sin(rifleAngle)*h*0.28 + h*0.05;
 
   // Back arm
-  const shoulderBackX = -h*0.18*f;
-  const shoulderY = torsoY + h*0.04;
-  ctx.lineWidth = h*0.08;
+  ctx.lineWidth = h*0.085;
   ctx.strokeStyle = armorWhite;
-
-  // Front arm + rifle
-  const shoulderFrontX = h*0.18*f;
-  // Hand position based on rifle angle
-  const armReach = h*0.28;
-  const handX = shoulderFrontX + Math.cos(rifleAngle*f)*armReach*f * (e.state==='shoot' ? 1.1 : 0.9);
-  const handY = shoulderY + Math.sin(rifleAngle)*armReach + h*0.05;
-
-  // Back arm (supports rifle near hand for aim)
-  ctx.beginPath();
-  ctx.moveTo(shoulderBackX, shoulderY);
   if(e.state === 'shoot' || e.state === 'raise'){
-    // Both hands on rifle
-    const supportX = handX - h*0.12*f;
+    const supportX = handX - h*0.14*f;
     const supportY = handY + h*0.02;
-    ctx.lineTo(supportX, supportY - h*0.05);
+    ctx.beginPath();
+    ctx.moveTo(-h*0.18*f, shoulderY);
+    ctx.lineTo(supportX - h*0.04*f, supportY - h*0.05);
     ctx.lineTo(supportX, supportY);
     ctx.stroke();
-    // small hand
-    ctx.fillStyle = '#222';
+    // Outline
+    ctx.lineWidth = h*0.085 + 4;
+    ctx.strokeStyle = '#000';
     ctx.beginPath();
-    ctx.arc(supportX, supportY, h*0.025, 0, Math.PI*2);
+    ctx.moveTo(-h*0.18*f, shoulderY);
+    ctx.lineTo(supportX - h*0.04*f, supportY - h*0.05);
+    ctx.lineTo(supportX, supportY);
+    ctx.stroke();
+    ctx.lineWidth = h*0.075;
+    ctx.strokeStyle = armorWhite;
+    ctx.beginPath();
+    ctx.moveTo(-h*0.18*f, shoulderY);
+    ctx.lineTo(supportX - h*0.04*f, supportY - h*0.05);
+    ctx.lineTo(supportX, supportY);
+    ctx.stroke();
+    // Glove on support hand
+    ctx.fillStyle = '#1a1a1a';
+    ctx.beginPath();
+    ctx.arc(supportX, supportY, h*0.028, 0, Math.PI*2);
     ctx.fill();
+    ctx.strokeStyle='#000'; ctx.lineWidth=1.5; ctx.stroke();
   } else {
-    ctx.lineTo(shoulderBackX + h*0.05*f, shoulderY + h*0.15);
-    ctx.lineTo(0, shoulderY + h*0.20);
+    // Relaxed back arm
+    ctx.beginPath();
+    ctx.moveTo(-h*0.18*f, shoulderY);
+    ctx.lineTo(-h*0.14*f, shoulderY + h*0.18);
+    ctx.lineTo(-h*0.08*f, shoulderY + h*0.28);
     ctx.stroke();
   }
 
-  ctx.lineWidth = h*0.08;
+  // Front arm
+  ctx.lineWidth = h*0.085 + 4;
+  ctx.strokeStyle = '#000';
+  ctx.beginPath();
+  ctx.moveTo(shoulderFrontX, shoulderY);
+  ctx.lineTo(shoulderFrontX + h*0.10*f + recoilOffset*0.5, shoulderY + h*0.06);
+  ctx.lineTo(handX, handY);
+  ctx.stroke();
+  ctx.lineWidth = h*0.075;
   ctx.strokeStyle = armorWhite;
   ctx.beginPath();
   ctx.moveTo(shoulderFrontX, shoulderY);
-  ctx.lineTo(shoulderFrontX + h*0.10*f, shoulderY + h*0.05);
+  ctx.lineTo(shoulderFrontX + h*0.10*f + recoilOffset*0.5, shoulderY + h*0.06);
   ctx.lineTo(handX, handY);
   ctx.stroke();
-
-  // Rifle
-  const rifleEndX = handX + Math.cos(rifleAngle*f)*h*0.45*f;
-  const rifleEndY = handY + Math.sin(rifleAngle)*h*0.45;
-  ctx.strokeStyle = '#222';
-  ctx.lineWidth = h*0.045;
+  // Glove
+  ctx.fillStyle = '#1a1a1a';
   ctx.beginPath();
-  ctx.moveTo(handX - h*0.05*f, handY + h*0.01);
+  ctx.arc(handX, handY, h*0.030, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle='#000'; ctx.lineWidth=1.5; ctx.stroke();
+
+  // === RIFLE - DC-15 carbine style ===
+  const rifleEndX = handX + Math.cos(rifleAngle*f)*h*0.50*f;
+  const rifleEndY = handY + Math.sin(rifleAngle)*h*0.50;
+  // Stock
+  ctx.fillStyle = '#2a2a2a';
+  ctx.fillRect(handX - h*0.12*f - (f<0?0:h*0.04), handY - h*0.04, h*0.16*f, h*0.08);
+  ctx.strokeStyle='#000'; ctx.lineWidth=1.5;
+  ctx.strokeRect(handX - h*0.12*f - (f<0?0:h*0.04), handY - h*0.04, h*0.16*f, h*0.08);
+  // Barrel
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.lineWidth = h*0.05;
+  ctx.beginPath();
+  ctx.moveTo(handX, handY);
   ctx.lineTo(rifleEndX, rifleEndY);
   ctx.stroke();
-  ctx.fillStyle = '#333';
-  ctx.fillRect(handX - h*0.10*f, handY - h*0.02, h*0.10*f, h*0.05);
-  ctx.fillStyle = '#555';
-  ctx.fillRect(handX + h*0.05*f, handY - h*0.04, h*0.08*f, h*0.03);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = h*0.057;
+  ctx.beginPath();
+  ctx.moveTo(handX, handY);
+  ctx.lineTo(rifleEndX, rifleEndY);
+  ctx.stroke();
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth = h*0.038;
+  ctx.beginPath();
+  ctx.moveTo(handX, handY);
+  ctx.lineTo(rifleEndX, rifleEndY);
+  ctx.stroke();
+  // Sight on top
+  ctx.fillStyle = '#222';
+  const sightX = handX + Math.cos(rifleAngle*f)*h*0.18*f - Math.sin(rifleAngle)*h*0.04;
+  const sightY = handY + Math.sin(rifleAngle)*h*0.18 - Math.cos(rifleAngle)*h*0.04;
+  ctx.beginPath();
+  ctx.arc(sightX, sightY, h*0.025, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle='#000'; ctx.stroke();
 
   // Charge indicator while raising
   if(e.state === 'raise'){
@@ -2621,69 +3094,392 @@ function drawClone(ctx, e){
 
   // Muzzle flash if shooting
   if(e.state==='shoot' && e.burstDelay > 0.27){
-    ctx.fillStyle = '#ffff44';
+    const grad = ctx.createRadialGradient(rifleEndX, rifleEndY, 0, rifleEndX, rifleEndY, h*0.10);
+    grad.addColorStop(0, '#ffffff');
+    grad.addColorStop(0.4, '#88ccff');
+    grad.addColorStop(1, 'rgba(60,170,255,0)');
+    ctx.fillStyle = grad;
     ctx.beginPath();
-    ctx.arc(rifleEndX, rifleEndY, h*0.06, 0, Math.PI*2);
-    ctx.fill();
-    ctx.fillStyle = '#ff8800';
-    ctx.beginPath();
-    ctx.arc(rifleEndX, rifleEndY, h*0.04, 0, Math.PI*2);
+    ctx.arc(rifleEndX, rifleEndY, h*0.10, 0, Math.PI*2);
     ctx.fill();
   }
 
-  // Helmet
-  const helmY = torsoY - h*0.06;
+  // === HELMET - Phase 1 ===
+  const helmY = torsoY - h*0.02;
   ctx.save();
   ctx.translate(0, helmY);
   if(crouch) ctx.translate(0, h*0.02);
+
+  // Helmet body
   ctx.fillStyle = armorWhite;
   ctx.beginPath();
-  ctx.moveTo(-h*0.13, 0);
-  ctx.lineTo(-h*0.10, -h*0.20);
-  ctx.lineTo(-h*0.04, -h*0.24);
-  ctx.lineTo(h*0.04, -h*0.24);
-  ctx.lineTo(h*0.10, -h*0.20);
-  ctx.lineTo(h*0.13, 0);
-  ctx.lineTo(h*0.10, h*0.04);
-  ctx.lineTo(-h*0.10, h*0.04);
+  ctx.moveTo(-h*0.14, h*0.02);          // bottom left
+  ctx.lineTo(-h*0.13, -h*0.10);          // upper left side
+  ctx.lineTo(-h*0.10, -h*0.20);          // top-left curve
+  ctx.lineTo(-h*0.04, -h*0.24);          // top-left peak
+  ctx.lineTo(h*0.04, -h*0.24);           // top-right peak
+  ctx.lineTo(h*0.10, -h*0.20);           // top-right curve
+  ctx.lineTo(h*0.13, -h*0.10);           // upper right side
+  ctx.lineTo(h*0.14, h*0.02);            // bottom right
+  ctx.lineTo(h*0.10, h*0.06);            // chin right
+  ctx.lineTo(-h*0.10, h*0.06);           // chin left
   ctx.closePath();
   ctx.fill();
   ctx.strokeStyle='#000'; ctx.lineWidth=2; ctx.stroke();
-  // Crest
+
+  // Pointed crest (Phase 1 distinctive)
   ctx.fillStyle = isCmd? accent : armorWhite;
   ctx.beginPath();
   ctx.moveTo(-h*0.04, -h*0.24);
-  ctx.lineTo(0, -h*0.32);
+  ctx.lineTo(0, -h*0.34);
   ctx.lineTo(h*0.04, -h*0.24);
   ctx.closePath();
-  ctx.fill(); ctx.stroke();
-  // T-visor
-  ctx.fillStyle = '#222';
+  ctx.fill();
+  ctx.strokeStyle='#000'; ctx.stroke();
+
+  // T-visor (Phase 1 - large angular T)
+  ctx.fillStyle = '#1a1a1a';
   ctx.beginPath();
-  ctx.moveTo(-h*0.08, -h*0.10);
-  ctx.lineTo(h*0.08, -h*0.10);
-  ctx.lineTo(h*0.06, -h*0.04);
-  ctx.lineTo(h*0.015, -h*0.04);
-  ctx.lineTo(h*0.015, h*0.02);
-  ctx.lineTo(-h*0.015, h*0.02);
-  ctx.lineTo(-h*0.015, -h*0.04);
-  ctx.lineTo(-h*0.06, -h*0.04);
+  // Top of T (horizontal bar)
+  ctx.moveTo(-h*0.09, -h*0.10);
+  ctx.lineTo(h*0.09, -h*0.10);
+  ctx.lineTo(h*0.07, -h*0.04);
+  ctx.lineTo(h*0.025, -h*0.04);
+  // Vertical of T
+  ctx.lineTo(h*0.025, h*0.04);
+  ctx.lineTo(-h*0.025, h*0.04);
+  ctx.lineTo(-h*0.025, -h*0.04);
+  ctx.lineTo(-h*0.07, -h*0.04);
   ctx.closePath();
-  ctx.fill(); ctx.stroke();
+  ctx.fill();
+  ctx.strokeStyle='#000'; ctx.lineWidth=1.5; ctx.stroke();
+
+  // Cheek vents (small dark rectangles)
   ctx.fillStyle='#444';
-  ctx.fillRect(-h*0.11, -h*0.05, h*0.025, h*0.04);
-  ctx.fillRect(h*0.085, -h*0.05, h*0.025, h*0.04);
+  ctx.fillRect(-h*0.115, -h*0.06, h*0.025, h*0.05);
+  ctx.fillRect(h*0.090, -h*0.06, h*0.025, h*0.05);
+  ctx.strokeStyle='#000'; ctx.lineWidth=1;
+  ctx.strokeRect(-h*0.115, -h*0.06, h*0.025, h*0.05);
+  ctx.strokeRect(h*0.090, -h*0.06, h*0.025, h*0.05);
+
+  // Side detail line
+  ctx.beginPath();
+  ctx.moveTo(-h*0.12, -h*0.02);
+  ctx.lineTo(-h*0.07, -h*0.02);
+  ctx.moveTo(h*0.07, -h*0.02);
+  ctx.lineTo(h*0.12, -h*0.02);
+  ctx.stroke();
+
+  // Commander stripes on helmet
   if(isCmd){
     ctx.strokeStyle = accent;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 2.5;
     ctx.beginPath();
     ctx.moveTo(-h*0.04, -h*0.22);
-    ctx.lineTo(-h*0.04, -h*0.30);
+    ctx.lineTo(-h*0.04, -h*0.32);
     ctx.moveTo(h*0.04, -h*0.22);
-    ctx.lineTo(h*0.04, -h*0.30);
+    ctx.lineTo(h*0.04, -h*0.32);
     ctx.stroke();
+    // Side circle
+    ctx.fillStyle = accent;
+    ctx.beginPath();
+    ctx.arc(-h*0.10*f, -h*0.13, h*0.018, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle='#000'; ctx.lineWidth=1; ctx.stroke();
   }
   ctx.restore();
+
+  ctx.restore();
+}
+
+/* ============================================================
+   B2 SUPER BATTLE DROID
+   ============================================================ */
+function drawB2Droid(ctx, e){
+  const sx = e.x - G.scrollX;
+  const sy = e.y;
+  const h = e.h;
+  const f = e.facing;
+  const metalC = '#5a6878';
+  const metalShade = '#3a4858';
+  const metalHl = '#7a8898';
+  const dark = '#1a2028';
+
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  const recoilOffset = e.armRecoil * h * 0.05 * (-f);
+  const walkBob = e.state === 'wait' ? 0 : Math.sin(e.walkT)*h*0.015;
+
+  // === LEGS - thick mechanical ===
+  const legLen = h * 0.42;
+  // Back leg
+  ctx.fillStyle = metalShade;
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  // Thigh
+  ctx.beginPath();
+  ctx.moveTo(-h*0.07*f - h*0.07, -legLen);
+  ctx.lineTo(-h*0.07*f + h*0.07, -legLen);
+  ctx.lineTo(-h*0.08*f + h*0.07, -legLen*0.45);
+  ctx.lineTo(-h*0.08*f - h*0.07, -legLen*0.45);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  // Shin
+  ctx.beginPath();
+  ctx.moveTo(-h*0.08*f - h*0.06, -legLen*0.45);
+  ctx.lineTo(-h*0.08*f + h*0.06, -legLen*0.45);
+  ctx.lineTo(-h*0.06*f + h*0.07, 0);
+  ctx.lineTo(-h*0.06*f - h*0.07, 0);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  // Knee joint (round)
+  ctx.fillStyle = dark;
+  ctx.beginPath();
+  ctx.arc(-h*0.08*f, -legLen*0.45, h*0.05, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+  // Foot
+  ctx.fillStyle = metalShade;
+  ctx.fillRect(-h*0.06*f - h*0.10, -h*0.04, h*0.20, h*0.05);
+  ctx.strokeRect(-h*0.06*f - h*0.10, -h*0.04, h*0.20, h*0.05);
+
+  // Front leg
+  ctx.fillStyle = metalC;
+  ctx.beginPath();
+  ctx.moveTo(h*0.07*f - h*0.08, -legLen);
+  ctx.lineTo(h*0.07*f + h*0.08, -legLen);
+  ctx.lineTo(h*0.08*f + h*0.08, -legLen*0.45);
+  ctx.lineTo(h*0.08*f - h*0.08, -legLen*0.45);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(h*0.08*f - h*0.07, -legLen*0.45);
+  ctx.lineTo(h*0.08*f + h*0.07, -legLen*0.45);
+  ctx.lineTo(h*0.06*f + h*0.08, 0);
+  ctx.lineTo(h*0.06*f - h*0.08, 0);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = dark;
+  ctx.beginPath();
+  ctx.arc(h*0.08*f, -legLen*0.45, h*0.05, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = metalC;
+  ctx.fillRect(h*0.06*f - h*0.10, -h*0.04, h*0.22, h*0.05);
+  ctx.strokeRect(h*0.06*f - h*0.10, -h*0.04, h*0.22, h*0.05);
+
+  // === MASSIVE TORSO - B2 signature bulky shape ===
+  const torsoTop = -legLen - h*0.50 + walkBob;
+  const torsoBot = -legLen + h*0.05;
+  // Body silhouette - hourglass with broad shoulders
+  ctx.fillStyle = metalC;
+  ctx.beginPath();
+  ctx.moveTo(-h*0.30, torsoTop + h*0.10);   // wide shoulder L
+  ctx.lineTo(-h*0.34, torsoTop + h*0.20);   // outer shoulder L
+  ctx.lineTo(-h*0.28, torsoTop + h*0.40);   // mid body L
+  ctx.lineTo(-h*0.20, torsoBot);            // narrow waist L
+  ctx.lineTo(h*0.20, torsoBot);             // narrow waist R
+  ctx.lineTo(h*0.28, torsoTop + h*0.40);    // mid body R
+  ctx.lineTo(h*0.34, torsoTop + h*0.20);    // outer shoulder R
+  ctx.lineTo(h*0.30, torsoTop + h*0.10);    // wide shoulder R
+  ctx.lineTo(h*0.18, torsoTop + h*0.06);    // neck join R
+  ctx.lineTo(h*0.10, torsoTop);             // top R
+  ctx.lineTo(-h*0.10, torsoTop);            // top L
+  ctx.lineTo(-h*0.18, torsoTop + h*0.06);   // neck join L
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Center chest detail (vertical seam + plates)
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(0, torsoTop + h*0.05);
+  ctx.lineTo(0, torsoBot - h*0.02);
+  ctx.stroke();
+  // Horizontal chest line
+  ctx.beginPath();
+  ctx.moveTo(-h*0.20, torsoTop + h*0.18);
+  ctx.lineTo(h*0.20, torsoTop + h*0.18);
+  ctx.stroke();
+  // Side panels (lighter highlights)
+  ctx.fillStyle = metalHl;
+  ctx.fillRect(-h*0.26, torsoTop + h*0.22, h*0.04, h*0.16);
+  ctx.fillRect(h*0.22, torsoTop + h*0.22, h*0.04, h*0.16);
+  ctx.strokeStyle='#000'; ctx.lineWidth=1;
+  ctx.strokeRect(-h*0.26, torsoTop + h*0.22, h*0.04, h*0.16);
+  ctx.strokeRect(h*0.22, torsoTop + h*0.22, h*0.04, h*0.16);
+
+  // Chest "collar bone" plates
+  ctx.fillStyle = metalShade;
+  ctx.beginPath();
+  ctx.moveTo(-h*0.16, torsoTop + h*0.06);
+  ctx.lineTo(-h*0.04, torsoTop + h*0.04);
+  ctx.lineTo(-h*0.04, torsoTop + h*0.14);
+  ctx.lineTo(-h*0.16, torsoTop + h*0.18);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(h*0.16, torsoTop + h*0.06);
+  ctx.lineTo(h*0.04, torsoTop + h*0.04);
+  ctx.lineTo(h*0.04, torsoTop + h*0.14);
+  ctx.lineTo(h*0.16, torsoTop + h*0.18);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // === BACK ARM (no weapon) - hangs at side ===
+  const armOriginX_back = -h*0.30*f;
+  const armOriginY = torsoTop + h*0.20;
+  ctx.fillStyle = metalShade;
+  // Upper arm
+  ctx.beginPath();
+  ctx.moveTo(armOriginX_back - h*0.05, armOriginY);
+  ctx.lineTo(armOriginX_back + h*0.05, armOriginY);
+  ctx.lineTo(armOriginX_back - h*0.05*f + h*0.05, armOriginY + h*0.20);
+  ctx.lineTo(armOriginX_back - h*0.05*f - h*0.05, armOriginY + h*0.20);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  // Forearm
+  ctx.fillStyle = metalC;
+  ctx.beginPath();
+  ctx.moveTo(armOriginX_back - h*0.05*f - h*0.05, armOriginY + h*0.20);
+  ctx.lineTo(armOriginX_back - h*0.05*f + h*0.05, armOriginY + h*0.20);
+  ctx.lineTo(armOriginX_back - h*0.10*f + h*0.06, armOriginY + h*0.40);
+  ctx.lineTo(armOriginX_back - h*0.10*f - h*0.06, armOriginY + h*0.40);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  // Elbow joint
+  ctx.fillStyle = dark;
+  ctx.beginPath();
+  ctx.arc(armOriginX_back - h*0.05*f, armOriginY + h*0.20, h*0.05, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+  // Hand fist
+  ctx.fillStyle = metalShade;
+  ctx.beginPath();
+  ctx.arc(armOriginX_back - h*0.10*f, armOriginY + h*0.42, h*0.045, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+
+  // === FRONT ARM with WRIST BLASTER ===
+  const armOriginX = h*0.30*f;
+  let frontArmAngle = 0; // 0 = horizontal, positive = down
+  if(e.state === 'wait'){ frontArmAngle = 0.7; }
+  else if(e.state === 'raise'){
+    const t = e.raiseT / 0.7;
+    frontArmAngle = 0.7 - t * 0.7;
+  } else if(e.state === 'shoot'){ frontArmAngle = 0; }
+
+  // Upper arm direction
+  const upperArmLen = h*0.22;
+  const elbowX = armOriginX + Math.cos(frontArmAngle*f)*upperArmLen*f * 0.8 + recoilOffset*0.5;
+  const elbowY = armOriginY + Math.sin(frontArmAngle)*upperArmLen + h*0.08;
+
+  // Upper arm (shoulder to elbow)
+  ctx.fillStyle = metalShade;
+  // Calculate perpendicular for arm width
+  const dxA = elbowX - armOriginX;
+  const dyA = elbowY - armOriginY;
+  const lenA = Math.hypot(dxA, dyA) || 1;
+  const nxA = -dyA/lenA, nyA = dxA/lenA;
+  const armW = h*0.07;
+  ctx.beginPath();
+  ctx.moveTo(armOriginX + nxA*armW, armOriginY + nyA*armW);
+  ctx.lineTo(armOriginX - nxA*armW, armOriginY - nyA*armW);
+  ctx.lineTo(elbowX - nxA*armW, elbowY - nyA*armW);
+  ctx.lineTo(elbowX + nxA*armW, elbowY + nyA*armW);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Forearm (extends straight forward when shooting)
+  const forearmLen = h*0.30;
+  const wristX = elbowX + Math.cos(frontArmAngle*f)*forearmLen*f + recoilOffset;
+  const wristY = elbowY + Math.sin(frontArmAngle)*forearmLen;
+
+  ctx.fillStyle = metalC;
+  const dxF = wristX - elbowX;
+  const dyF = wristY - elbowY;
+  const lenF = Math.hypot(dxF, dyF) || 1;
+  const nxF = -dyF/lenF, nyF = dxF/lenF;
+  const farmW = h*0.08;
+  ctx.beginPath();
+  ctx.moveTo(elbowX + nxF*farmW, elbowY + nyF*farmW);
+  ctx.lineTo(elbowX - nxF*farmW, elbowY - nyF*farmW);
+  ctx.lineTo(wristX - nxF*farmW, wristY - nyF*farmW);
+  ctx.lineTo(wristX + nxF*farmW, wristY + nyF*farmW);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Elbow joint
+  ctx.fillStyle = dark;
+  ctx.beginPath();
+  ctx.arc(elbowX, elbowY, h*0.06, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+
+  // Wrist blaster muzzle (built into forearm tip)
+  const muzzleX = wristX + Math.cos(frontArmAngle*f)*h*0.05*f;
+  const muzzleY = wristY + Math.sin(frontArmAngle)*h*0.05;
+  ctx.fillStyle = '#1a1a1a';
+  ctx.beginPath();
+  ctx.arc(muzzleX, muzzleY, h*0.045, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle='#000'; ctx.lineWidth=2; ctx.stroke();
+  // Inner muzzle
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(muzzleX, muzzleY, h*0.025, 0, Math.PI*2);
+  ctx.fill();
+
+  // Charge glow when raising
+  if(e.state === 'raise'){
+    const t = e.raiseT / 0.7;
+    const flash = (t > 0.6 && Math.floor(t*15)%2===0) ? '#ff4444' : '#ff9933';
+    ctx.fillStyle = flash;
+    ctx.beginPath();
+    ctx.arc(muzzleX, muzzleY, h*0.025 * (0.5 + t*0.6), 0, Math.PI*2);
+    ctx.fill();
+  }
+  // Muzzle flash
+  if(e.state==='shoot' && e.burstDelay > 0.17){
+    const grad = ctx.createRadialGradient(muzzleX, muzzleY, 0, muzzleX, muzzleY, h*0.12);
+    grad.addColorStop(0, '#ffffff');
+    grad.addColorStop(0.4, '#88ccff');
+    grad.addColorStop(1, 'rgba(60,170,255,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(muzzleX, muzzleY, h*0.12, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // === HEAD - small dome with sensor strip ===
+  const headY = torsoTop - h*0.04;
+  ctx.save();
+  ctx.translate(0, headY);
+  // Head body (squat angular)
+  ctx.fillStyle = metalC;
+  ctx.beginPath();
+  ctx.moveTo(-h*0.10, h*0.02);
+  ctx.lineTo(-h*0.10, -h*0.06);
+  ctx.lineTo(-h*0.07, -h*0.13);
+  ctx.lineTo(h*0.07, -h*0.13);
+  ctx.lineTo(h*0.10, -h*0.06);
+  ctx.lineTo(h*0.10, h*0.02);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle='#000'; ctx.lineWidth=2; ctx.stroke();
+
+  // Photoreceptor strip (red sensor)
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(-h*0.08, -h*0.06, h*0.16, h*0.04);
+  ctx.strokeRect(-h*0.08, -h*0.06, h*0.16, h*0.04);
+  // Glowing eye
+  ctx.fillStyle = '#ff3322';
+  ctx.fillRect(-h*0.06, -h*0.05, h*0.12, h*0.02);
+  // Glow
+  ctx.fillStyle = 'rgba(255,80,40,0.4)';
+  ctx.fillRect(-h*0.08, -h*0.07, h*0.16, h*0.06);
+  ctx.fillStyle = '#ff5544';
+  ctx.fillRect(-h*0.06, -h*0.05, h*0.12, h*0.015);
+
+  // Mouth grille (vents)
+  ctx.fillStyle = dark;
+  ctx.fillRect(-h*0.04, -h*0.005, h*0.08, h*0.018);
+  ctx.strokeStyle='#000';
+  ctx.strokeRect(-h*0.04, -h*0.005, h*0.08, h*0.018);
+  ctx.restore();
+
   ctx.restore();
 }
 
@@ -2800,7 +3596,47 @@ function renderFx(sx,sy){
       ctx.beginPath();
       ctx.arc(p.x - G.scrollX, p.y, p.size, 0, Math.PI*2);
       ctx.fill();
+    } else if(p.type==='puff'){
+      // Tartakovsky puff explosion: flat colored circles
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = a * 0.9;
+      ctx.beginPath();
+      ctx.arc(p.x - G.scrollX, p.y, p.size, 0, Math.PI*2);
+      ctx.fill();
+      // Black outline like Tartakovsky
+      ctx.strokeStyle = '#000';
+      ctx.globalAlpha = a * 0.5;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else if(p.type==='debris'){
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = a;
+      ctx.fillRect(p.x - G.scrollX - p.size/2, p.y - p.size/2, p.size, p.size);
     }
+  }
+  ctx.globalAlpha=1;
+
+  // Tartakovsky-style explosion ring
+  for(const ex of G.explosions){
+    const a = ex.life / ex.max;
+    const cx = ex.x - G.scrollX;
+    // Bright center flash
+    if(a > 0.7){
+      const flashA = (a - 0.7) / 0.3;
+      const grad = ctx.createRadialGradient(cx, ex.y, 0, cx, ex.y, ex.r * 0.8);
+      grad.addColorStop(0, `rgba(255,238,136,${flashA})`);
+      grad.addColorStop(0.5, `rgba(255,140,40,${flashA*0.6})`);
+      grad.addColorStop(1, 'rgba(180,40,20,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(cx, ex.y, ex.r*0.8, 0, Math.PI*2);
+      ctx.fill();
+    }
+    // Outer red puff body
+    ctx.fillStyle = `rgba(170,40,30,${a*0.5})`;
+    ctx.beginPath();
+    ctx.arc(cx, ex.y, ex.r * 0.6, 0, Math.PI*2);
+    ctx.fill();
   }
   ctx.globalAlpha=1;
 
